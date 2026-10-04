@@ -510,3 +510,63 @@ MASSIVE `en`, `--per-lang 300 --n-opts 20`, seed 13, laya 0.3.21, CPU (65 wrong 
 | `agreement_option_order` | 0.678 | |
 
 With one variant per transform, only `support_all` clearly ranks errors below correct answers better than `confidence`; the binary `agreement_*` signals rank them worse. Keeping the top 70% of cases gives 93.3% accuracy by `support_all` and 91.0% by `confidence`.
+
+
+## Stability hook prototype (experimental)
+
+`stability.py` is a prototype for #635 (https://github.com/NandhaKishorM/laya/issues/635): answer stability under option reorder and rename, as a predict hook, with no core change. `StabilityHook` adds, in `on_predict_start`, re-asked copies of every `choice` question as extra question rows in the same forward pass, and folds them back in `on_predict_end`:
+
+```python
+import laya
+from research.eval.stability import StabilityHook
+
+agent = laya.load("convaiinnovations/laya")
+answer = agent.predict(state, questions, hooks=[StabilityHook()])["answers"]["intent"]
+answer["reliability"]["soft_stability"]   # mean probability of the chosen option over all copies
+```
+
+The copies are the reversed order and three seeded shuffles (through `option_order`, so Laya maps the probabilities back itself), and, for option sets of at most 20 options, the descriptions under opaque keys `A`, `B`, `C`... in canonical, reversed and shuffled order. Above 20 options a rename can leave only a fragment of each description (#543), so rename copies are skipped there (`rename_max_options`). Copies are seeded from the question id, so every state in a batch gets the same copies. Duplicate copies are dropped, since Laya is deterministic and a repeat would always agree.
+
+The caller gets the questions it asked plus a `reliability` field on each choice answer: `soft_stability`, `stability` (share of copies that kept the answer), `n_variants` (rows used, the original included), `variant_choices`, `distinct_choices` and `variants_collapsed` (copies whose options lost distinct token spans). Laya's own answer is unchanged. Copies are removed from `answers`, `usage["truncated_questions"]` and `usage["options"]`; `usage["input_tokens"]` keeps their cost. Abstention fields that `min_confidence` writes onto the copies are dropped with them; the original answer keeps its own. `score` and `noul` questions are untouched.
+
+`python -m research.eval.stability` runs MASSIVE through the existing harness sampler, once plain and once hooked per case, and reports AUROC with the selective-classification metrics from `laya.evals` (AURC, Brier, selective accuracy) for `answer_confidence`, `soft_stability` and `stability`, bootstrap 95% intervals for the AUROC and AURC differences, and the measured cost: rows, tokens and time per case, collapsed options, and a `predict_batch` timing on one shared question.
+
+```bash
+python -m research.eval.stability --langs en --per-lang 300 --n-opts 20 --out stability_k20.json
+python -m unittest research.eval.test_stability -v
+```
+
+### Measured
+
+MASSIVE `en`, `--per-lang 300`, seed 13, laya 0.3.26, CPU, no binning map. Bootstrap intervals over cases, 2,000 resamples.
+
+| | 20 options (65 wrong) | 6 options (30 wrong) |
+|---|---:|---:|
+| AUROC `answer_confidence` | 0.831 | 0.913 |
+| AUROC `soft_stability` | 0.907 | 0.943 |
+| AUROC difference | +0.076 (+0.031 to +0.125) | +0.030 (-0.005 to +0.067) |
+| AURC `answer_confidence` | 0.072 | 0.015 |
+| AURC `soft_stability` | 0.050 | 0.012 |
+| AURC difference | -0.033 (-0.064 to -0.008) | -0.004 (-0.009 to +0.001) |
+| Selective accuracy @50%, `answer_confidence` vs. `soft_stability` | 0.947 vs. 0.980 | 0.993 vs. 0.993 |
+
+At 20 options, 37 of the 65 wrong answers have `answer_confidence >= 0.90`; at least one copy changes the answer for 29 of them. At 6 options there are 3 such answers. Every hooked answer matched the plain one (300/300 at both sizes).
+
+Cost on CPU, plain vs. hooked:
+
+| | 20 options | 6 options |
+|---|---:|---:|
+| Rows per question | 1 vs. 8 | 1 vs. 8 |
+| Input tokens per case | 190 vs. 1,392 | 86 vs. 632 |
+| ms per case, `predict` | 990 vs. 6,865 | 444 vs. 3,075 |
+| ms per state, `predict_batch` (64 states, batch size 16) | 941 vs. 7,275 | 282 vs. 2,183 |
+
+At 20 options and `head_max_len=192`, the original question's options collapse (fewer distinct token spans than options) in 140 of 300 cases, and accuracy there is 0.721 against 0.838 elsewhere. The four reordered copies collapse in exactly the same cases; the three renamed copies, with shorter keys, never do.
+
+### Limits
+
+- Cost scales with rows: on CPU, batching does not reduce it.
+- GPU is not measured.
+- Stability cannot flag an answer that is wrong under every copy, such as a consistent misreading.
+- Where `answer_confidence` already separates well (6 options), the gain is small and not established.
+- English, one checkpoint, 300 cases per option count.
