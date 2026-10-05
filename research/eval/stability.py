@@ -1,12 +1,21 @@
-"""Answer stability under option reorder and rename, as a predict hook (prototype for #635).
+"""Answer stability under option rename and reorder, as a predict hook (#635).
 
-`StabilityHook` adds, in `on_predict_start`, re-asked copies of every `choice` question: the
-same options in other slot orders (through `option_order`) and, when the option set is small
-enough that a rename keeps the option text (#543), the same descriptions under opaque keys
-`A`, `B`, `C`... The copies are extra question rows in the same forward pass. In
-`on_predict_end` they are folded back: each choice answer gains a `reliability` field and the
-copies are removed, so the caller gets the questions it asked plus that one field. Laya's own
-answer is not changed, and no core code is touched.
+`StabilityHook` adds, in `on_predict_start`, re-asked copies of every `choice` question and
+folds them back in `on_predict_end`, so the caller gets the questions it asked plus a
+`reliability` field on each choice answer. Laya's own answer is unchanged and no core code is
+touched. The copies are extra question rows in the same forward pass.
+
+Which probes run depends on the checkpoint's `option_layout` (#951):
+
+* rename probes, always: the same options in the same slots, under opaque keys `A`, `B`,
+  `C`... assigned forwards, backwards and shuffled. Skipped above `rename_max_options`, where a
+  rename can leave only a fragment of each description (#543).
+* reorder probes, only on a sequential checkpoint: the reversed order and seeded shuffles,
+  through `option_order`. On a parallel checkpoint the logits permute with the options, so a
+  reorder probe always agrees and would only add cost.
+
+`reliability["probes"]` names the probe kinds that actually ran. When none could run, the
+signals are `None`, never a perfect score, so a caller can tell an absence from a zero.
 
 Run from the repository root after installing Laya and `datasets`:
 
@@ -31,8 +40,10 @@ from . import laya_eval as harness
 from .metamorphic import auroc, opaque_labels
 
 SEP = "::stab"
+PROBES = ("rename", "reorder")
+LAYOUTS = ("auto", "sequential", "parallel")
 # Above this many options the head budget cuts option text, and a rename can leave only a
-# fragment of each description (#543), so rename copies are skipped there.
+# fragment of each description (#543), so rename probes are skipped there.
 RENAME_MAX_OPTIONS = 20
 
 
@@ -40,68 +51,91 @@ class StabilityHook(BaseHook):
     """Adds a `reliability` field to every choice answer from re-asked copies of the question.
 
     reliability = {
-        "soft_stability":   mean probability of the chosen option over the original and every copy,
-        "stability":        share of copies whose answer is the chosen option,
-        "n_variants":       rows used for the question, the original included,
-        "variant_choices":  each copy's answer, mapped back to the caller's option keys,
-        "distinct_choices": the different answers seen,
+        "layout":             "sequential" or "parallel", the layout the probes were chosen for,
+        "probes":             probe kinds that ran, e.g. ["rename", "reorder"]; [] if none could,
+        "soft_stability":     mean probability of the chosen option over the original and every copy,
+        "stability":          share of copies whose answer is the chosen option,
+        "by_probe":           the same two numbers, and the copy count, per probe kind,
+        "n_variants":         rows used for the question, the original included,
+        "variant_choices":    each copy's answer, mapped back to the caller's option keys,
+        "distinct_choices":   the different answers seen,
         "variants_collapsed": copies whose options lost their distinct token spans,
     }
 
-    Copies are seeded from the question id, so every state in a batch, and every call, gets the
-    same copies. A question's own `option_order` applies to the original only.
+    `layout="auto"` reads the layout from the agent running the call (`ctx.agent`), defaulting
+    to sequential, the layout of every published checkpoint. `probes` restricts the probe kinds,
+    e.g. `probes=("rename",)` to measure what a parallel checkpoint would get. Copies are seeded
+    from the question id, so every state in a batch, and every call, gets the same copies.
     """
 
-    def __init__(self, shuffles: int = 3, renames: bool = True,
-                 rename_max_options: int = RENAME_MAX_OPTIONS, seed: int = 13):
-        if shuffles < 0:
-            raise ValueError("shuffles must be >= 0")
+    def __init__(self, shuffles: int = 3, renames: int = 3,
+                 rename_max_options: int = RENAME_MAX_OPTIONS, layout: str = "auto",
+                 probes: Sequence[str] = PROBES, seed: int = 13):
+        if shuffles < 0 or renames < 0:
+            raise ValueError("shuffles and renames must be >= 0")
+        if layout not in LAYOUTS:
+            raise ValueError("layout must be one of %s, got %r" % (", ".join(LAYOUTS), layout))
+        unknown = set(probes) - set(PROBES)
+        if unknown:
+            raise ValueError("unknown probes %s; use %s" % (sorted(unknown), ", ".join(PROBES)))
         self.shuffles = shuffles
         self.renames = renames
         self.rename_max_options = rename_max_options
+        self.layout = layout
+        self.probes = tuple(p for p in PROBES if p in probes)
         self.seed = seed
         self._plans: "weakref.WeakKeyDictionary[Any, tuple]" = weakref.WeakKeyDictionary()
         self._lock = threading.Lock()
 
-    def variants(self, qid: str, question: Dict[str, Any]) -> List[tuple]:
-        """(name, question, renamed key -> caller key or None) for each copy of one question."""
+    def layout_of(self, ctx) -> str:
+        if self.layout != "auto":
+            return self.layout
+        return "parallel" if getattr(ctx.agent, "parallel_options", False) else "sequential"
+
+    def variants(self, qid: str, question: Dict[str, Any], layout: str = "sequential") -> List[tuple]:
+        """(probe, name, question, renamed key -> caller key or None) for each copy of one question."""
         keys = list(question["criteria"])
         n = len(keys)
         rng = random.Random(zlib.crc32(("%s|%s" % (self.seed, qid)).encode("utf-8")))
-        identity = list(range(n))
-        orders = [("reversed", identity[::-1])]
-        for i in range(self.shuffles):
-            order = identity[:]
-            rng.shuffle(order)
-            orders.append(("shuffle%d" % (i + 1), order))
-        candidates = [(name, order, False) for name, order in orders]
-        if self.renames and n <= self.rename_max_options:
-            shuffled = identity[:]
-            rng.shuffle(shuffled)
-            candidates += [("rename", identity, True), ("rename_reversed", identity[::-1], True),
-                           ("rename_shuffle", shuffled, True)]
-
         base = {k: v for k, v in question.items() if k != "option_order"}
-        labels = opaque_labels(n)
-        seen = {(tuple(identity), False)}  # the original; a repeat would always agree with it
         out = []
-        for name, order, rename in candidates:
-            if (tuple(order), rename) in seen:
-                continue
-            seen.add((tuple(order), rename))
-            copy = dict(base)
-            back = None
-            if rename:
-                copy["criteria"] = dict(zip(labels, question["criteria"].values()))
-                back = dict(zip(labels, keys))
-            if order != identity:
+        if "rename" in self.probes and n <= self.rename_max_options and self.renames:
+            labels = opaque_labels(n)
+            assignments = [("rename", labels), ("rename_reversed", labels[::-1])]
+            for i in range(max(0, self.renames - 2)):
+                shuffled = labels[:]
+                rng.shuffle(shuffled)
+                assignments.append(("rename_shuffle%d" % (i + 1), shuffled))
+            seen = set()
+            for name, assigned in assignments[:self.renames]:
+                if tuple(assigned) in seen:
+                    continue
+                seen.add(tuple(assigned))
+                copy = dict(base)
+                # same slots and descriptions; only the model-facing keys change
+                copy["criteria"] = dict(zip(assigned, question["criteria"].values()))
+                out.append(("rename", name, copy, dict(zip(assigned, keys))))
+        if "reorder" in self.probes and layout == "sequential":
+            identity = list(range(n))
+            seen = {tuple(identity)}  # the original; a repeat would always agree with it
+            orders = [("reversed", identity[::-1])]
+            for i in range(self.shuffles):
+                order = identity[:]
+                rng.shuffle(order)
+                orders.append(("shuffle%d" % (i + 1), order))
+            for name, order in orders:
+                if tuple(order) in seen:
+                    continue
+                seen.add(tuple(order))
+                copy = dict(base)
                 copy["option_order"] = list(order)
-            out.append((name, copy, back))
+                out.append(("reorder", name, copy, None))
         return out
 
     def on_predict_start(self, ctx) -> None:
         if ctx.results is not None or not isinstance(ctx.questions, dict):
             return
+        layout = self.layout_of(ctx)
         packed = dict(ctx.questions)
         plan: Dict[str, List[tuple]] = {}
         for qid, question in ctx.questions.items():
@@ -110,15 +144,15 @@ class StabilityHook(BaseHook):
             if (not isinstance(question, dict) or question.get("type") != "choice"
                     or not isinstance(question.get("criteria"), dict) or len(question["criteria"]) < 2):
                 continue
-            plan[qid] = []
-            for i, (name, copy, back) in enumerate(self.variants(qid, question), 1):
+            plan[qid] = []  # kept even when empty, so the answer still reports that no probe ran
+            for i, (probe, name, copy, back) in enumerate(self.variants(qid, question, layout), 1):
                 key = "%s%s%d" % (qid, SEP, i)
                 packed[key] = copy
-                plan[qid].append((name, key, back))
+                plan[qid].append((probe, name, key, back))
         if not plan:
             return
         with self._lock:
-            self._plans[ctx] = (ctx.questions, plan)
+            self._plans[ctx] = (ctx.questions, plan, layout)
         ctx.questions = packed
 
     def on_predict_end(self, ctx) -> None:
@@ -126,10 +160,10 @@ class StabilityHook(BaseHook):
             entry = self._plans.pop(ctx, None)
         if entry is None:
             return
-        ctx.questions, plan = entry
+        ctx.questions, plan, layout = entry
         if not ctx.results:
             return
-        copies = {key for steps in plan.values() for _, key, _ in steps}
+        copies = {key for steps in plan.values() for _, _, key, _ in steps}
         for result in ctx.results:
             answers = result.get("answers") or {}
             usage = result.get("usage") or {}
@@ -137,7 +171,7 @@ class StabilityHook(BaseHook):
             for qid, steps in plan.items():
                 answer = answers.get(qid)
                 if isinstance(answer, dict) and answer.get("choice") is not None:
-                    answer["reliability"] = _fold(answer, steps, answers, collapsed)
+                    answer["reliability"] = _fold(answer, steps, answers, collapsed, layout)
             for key in copies:
                 answers.pop(key, None)
             if "truncated_questions" in usage:
@@ -150,26 +184,39 @@ class StabilityHook(BaseHook):
                     usage.pop("options", None)
 
 
+def _summary(winner: str, original: Optional[float], copies: List[tuple]) -> Dict[str, Any]:
+    if not copies:
+        return {"n": 0, "soft_stability": None, "stability": None}
+    support = [p for _, _, p in copies] + ([original] if original is not None else [])
+    return {"n": len(copies), "soft_stability": round(sum(support) / len(support), 4),
+            "stability": round(sum(c == winner for _, c, _ in copies) / len(copies), 4)}
+
+
 def _fold(answer: Dict[str, Any], steps: List[tuple], answers: Dict[str, Any],
-          collapsed: Dict[str, Any]) -> Dict[str, Any]:
+          collapsed: Dict[str, Any], layout: str) -> Dict[str, Any]:
     winner = answer["choice"]
-    support = [float(answer.get("probabilities", {}).get(winner, 0.0))]
-    choices = {}
-    for name, key, back in steps:
+    original = float((answer.get("probabilities") or {}).get(winner, 0.0))
+    seen = []  # (probe, name, choice, support)
+    for probe, name, key, back in steps:
         copy = answers.get(key)
         if not isinstance(copy, dict) or copy.get("choice") is None:
             continue
         back = back or {}
         probabilities = {back.get(k, k): v for k, v in (copy.get("probabilities") or {}).items()}
-        choices[name] = back.get(copy["choice"], copy["choice"])
-        support.append(float(probabilities.get(winner, 0.0)))
+        seen.append((probe, name, back.get(copy["choice"], copy["choice"]), float(probabilities.get(winner, 0.0))))
+    ran = [p for p in PROBES if any(s[0] == p for s in seen)]
+    overall = _summary(winner, original, [(n, c, p) for _, n, c, p in seen])
     return {
-        "soft_stability": round(sum(support) / len(support), 4),
-        "stability": round(sum(c == winner for c in choices.values()) / len(choices), 4) if choices else 1.0,
-        "n_variants": len(support),
-        "variant_choices": choices,
-        "distinct_choices": sorted({winner, *choices.values()}),
-        "variants_collapsed": sum(key in collapsed for _, key, _ in steps),
+        "layout": layout,
+        "probes": ran,
+        "soft_stability": overall["soft_stability"],
+        "stability": overall["stability"],
+        # per kind the original is left out, so each number reflects that probe alone
+        "by_probe": {p: _summary(winner, None, [(n, c, s) for k, n, c, s in seen if k == p]) for p in ran},
+        "n_variants": 1 + len(seen),
+        "variant_choices": {name: choice for _, name, choice, _ in seen},
+        "distinct_choices": sorted({winner, *(choice for _, _, choice, _ in seen)}),
+        "variants_collapsed": sum(key in collapsed for _, _, key, _ in steps),
     }
 
 
@@ -230,6 +277,9 @@ def evaluate_language(agent, hook: StabilityHook, cases, gold, keys, batch_state
             "correct": p["choice"] == keys[i][gold[i]],
             "answer_confidence": p["answer_confidence"],
             "soft_stability": rel["soft_stability"], "stability": rel["stability"],
+            "soft_rename": (rel["by_probe"].get("rename") or {}).get("soft_stability"),
+            "soft_reorder": (rel["by_probe"].get("reorder") or {}).get("soft_stability"),
+            "probes": rel["probes"],
             "same_answer": h["choice"] == p["choice"]
                            and abs(h["answer_confidence"] - p["answer_confidence"]) <= 1e-4,
             "rows": rel["n_variants"], "variants_collapsed": rel["variants_collapsed"],
@@ -243,14 +293,19 @@ def evaluate_language(agent, hook: StabilityHook, cases, gold, keys, batch_state
             print("  %d/%d" % (i + 1, len(cases)), flush=True)
 
     correct = [r["correct"] for r in rows]
-    signals = {s: signal_metrics([r[s] for r in rows], correct)
-               for s in ("answer_confidence", "soft_stability", "stability")}
+    present = [s for s in ("answer_confidence", "soft_stability", "stability", "soft_rename", "soft_reorder")
+               if all(r[s] is not None for r in rows)]
+    signals = {s: signal_metrics([r[s] for r in rows], correct) for s in present}
     differences = {}
     if 0 < sum(correct) < len(correct):
-        for metric in ("auroc", "aurc"):
-            differences["soft_stability - answer_confidence, " + metric] = bootstrap_difference(
-                rows, "soft_stability", "answer_confidence", metric)
+        for signal in ("soft_stability", "soft_rename", "soft_reorder"):
+            if signal not in present:
+                continue
+            for metric in ("auroc", "aurc"):
+                differences["%s - answer_confidence, %s" % (signal, metric)] = bootstrap_difference(
+                    rows, signal, "answer_confidence", metric)
     cost = {
+        "probes_run": sorted({p for r in rows for p in r["probes"]}),
         "rows_per_question": _mean(r["rows"] for r in rows),
         "tokens_per_case_plain": _mean(r["tokens_plain"] for r in rows),
         "tokens_per_case_hooked": _mean(r["tokens_hooked"] for r in rows),
@@ -318,8 +373,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--n-opts", type=int, default=harness.N_OPTS)
     parser.add_argument("--seed", type=int, default=harness.SEED)
     parser.add_argument("--shuffles", type=int, default=3)
-    parser.add_argument("--no-renames", action="store_true")
+    parser.add_argument("--renames", type=int, default=3)
     parser.add_argument("--rename-max-options", type=int, default=RENAME_MAX_OPTIONS)
+    parser.add_argument("--layout", choices=LAYOUTS, default="auto",
+                        help="probe set to choose: auto reads the checkpoint config")
+    parser.add_argument("--probes", default=",".join(PROBES),
+                        help="comma-separated probe kinds; 'rename' alone is what a parallel checkpoint gets")
     parser.add_argument("--batch-states", type=int, default=64, help="states for the predict_batch timing; 0 skips it")
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--out", required=True, help="JSON report path")
@@ -328,13 +387,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     import laya
 
     agent = laya.load(args.model, device=args.device, subfolder=args.subfolder)
-    hook = StabilityHook(shuffles=args.shuffles, renames=not args.no_renames,
-                         rename_max_options=args.rename_max_options, seed=args.seed)
+    hook = StabilityHook(shuffles=args.shuffles, renames=args.renames,
+                         rename_max_options=args.rename_max_options, layout=args.layout,
+                         probes=[p.strip() for p in args.probes.split(",") if p.strip()], seed=args.seed)
     payload: Dict[str, Any] = {
         "config": {**vars(args), "dataset": harness.DATASET, "split": "test",
                    "device": str(agent.device), "laya_version": laya.__version__,
                    "max_len": agent.cfg.get("max_len"), "head_max_len": agent.cfg.get("head_max_len"),
-                   "binning_map": bool(getattr(agent, "binning_map", None))},
+                   "binning_map": bool(getattr(agent, "binning_map", None)),
+                   "option_layout": "parallel" if getattr(agent, "parallel_options", False) else "sequential"},
         "report": {}, "cases": {},
     }
     failed = False

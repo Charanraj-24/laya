@@ -13,14 +13,19 @@ QUESTIONS = {"intent": {
 DESCRIPTION_WEIGHTS = {"payment issues": 0.7, "software help": 0.2, "new purchases": 0.1}
 
 
-def run(hook, states, questions, slot_scorer, collapse=()):
+class FakeAgent:
+    def __init__(self, parallel=False):
+        self.parallel_options = parallel
+
+
+def run(hook, states, questions, slot_scorer, collapse=(), agent=None):
     """Mimic Agent.predict_batch: start hooks, one answer per question row, end hooks.
 
     `slot_scorer(state, keys_by_slot, texts_by_slot)` returns weights in slot order. As in Laya,
     slot s shows option `option_order[s]`, and probabilities come back in the question's own
     option order. Question ids in `collapse` report collapsed options in `usage["options"]`.
     """
-    ctx = PredictContext(states=list(states), questions=questions)
+    ctx = PredictContext(states=list(states), questions=questions, agent=agent or FakeAgent())
     hook.on_predict_start(ctx)
     results = []
     for state in ctx.states:
@@ -49,6 +54,10 @@ def run(hook, states, questions, slot_scorer, collapse=()):
     return ctx
 
 
+def reliability(ctx, qid="intent", i=0):
+    return ctx.results[i]["answers"][qid]["reliability"]
+
+
 def by_description(state, keys, texts):
     return [DESCRIPTION_WEIGHTS[t] for t in texts]
 
@@ -67,30 +76,42 @@ class VariantTests(unittest.TestCase):
         hook = s.StabilityHook()
         first = hook.variants("intent", QUESTIONS["intent"])
         self.assertEqual(first, s.StabilityHook().variants("intent", QUESTIONS["intent"]))
-        shapes = [(tuple(q.get("option_order", (0, 1, 2))), back is not None) for _, q, back in first]
+        shapes = [(tuple(q.get("option_order", (0, 1, 2))), tuple(q["criteria"])) for _, _, q, _ in first]
         self.assertEqual(len(shapes), len(set(shapes)))
-        self.assertNotIn(((0, 1, 2), False), shapes)  # the original is never repeated
-        for _, q, back in first:
-            self.assertEqual(sorted(q.get("option_order", [0, 1, 2])), [0, 1, 2])
-            self.assertEqual(list(q["criteria"].values()), list(QUESTIONS["intent"]["criteria"].values()))
-            if back:
-                self.assertEqual(list(q["criteria"]), ["A", "B", "C"])
-                self.assertEqual(back, {"A": "billing", "B": "technical", "C": "sales"})
+        self.assertNotIn(((0, 1, 2), ("billing", "technical", "sales")), shapes)  # never the original
+        descriptions = list(QUESTIONS["intent"]["criteria"].values())
+        for probe, _, q, back in first:
+            if probe == "rename":
+                self.assertNotIn("option_order", q)  # renames keep every option in its slot
+                self.assertEqual(list(q["criteria"].values()), descriptions)
+                self.assertEqual(sorted(q["criteria"]), ["A", "B", "C"])
+                self.assertEqual(sorted(back.values()), sorted(QUESTIONS["intent"]["criteria"]))
+            else:
+                self.assertEqual(list(q["criteria"]), list(QUESTIONS["intent"]["criteria"]))
+                self.assertEqual(sorted(q["option_order"]), [0, 1, 2])
+
+    def test_layout_chooses_the_probes(self):
+        hook = s.StabilityHook()
+        sequential = {p for p, _, _, _ in hook.variants("intent", QUESTIONS["intent"], "sequential")}
+        parallel = {p for p, _, _, _ in hook.variants("intent", QUESTIONS["intent"], "parallel")}
+        self.assertEqual(sequential, {"rename", "reorder"})
+        self.assertEqual(parallel, {"rename"})  # a reorder probe always agrees on a parallel checkpoint
 
     def test_two_options_and_rename_limit(self):
         two = {"type": "choice", "criteria": {"yes_please": "accept", "no_thanks": "decline"}}
-        names = [name for name, _, _ in s.StabilityHook(shuffles=5).variants("q", two)]
-        self.assertEqual(len(names), 3)  # reversed, rename, rename_reversed: nothing else is distinct
+        names = [n for _, n, _, _ in s.StabilityHook(shuffles=5).variants("q", two)]
+        self.assertEqual(sorted(names), ["rename", "rename_reversed", "reversed"])
         many = {"type": "choice", "criteria": {"k%d" % i: "option %d" % i for i in range(25)}}
-        names = [name for name, _, _ in s.StabilityHook().variants("q", many)]
-        self.assertFalse(any(n.startswith("rename") for n in names))
-        names = [name for name, _, _ in s.StabilityHook(renames=False).variants("intent", QUESTIONS["intent"])]
-        self.assertFalse(any(n.startswith("rename") for n in names))
+        probes = {p for p, _, _, _ in s.StabilityHook().variants("q", many)}
+        self.assertEqual(probes, {"reorder"})
+        self.assertEqual(s.StabilityHook().variants("q", many, "parallel"), [])
+        probes = {p for p, _, _, _ in s.StabilityHook(probes=("reorder",)).variants("intent", QUESTIONS["intent"])}
+        self.assertEqual(probes, {"reorder"})
 
     def test_own_option_order_is_not_copied(self):
         question = dict(QUESTIONS["intent"], option_order=[2, 0, 1])
-        copies = {name: q for name, q, _ in s.StabilityHook().variants("intent", question)}
-        self.assertNotIn("option_order", copies["rename"])  # shown in the canonical order
+        copies = {name: q for _, name, q, _ in s.StabilityHook().variants("intent", question)}
+        self.assertNotIn("option_order", copies["rename"])
         self.assertEqual(copies["reversed"]["option_order"], [2, 1, 0])
 
 
@@ -105,25 +126,46 @@ class HookTests(unittest.TestCase):
             answer = result["answers"]["intent"]
             self.assertEqual(answer["choice"], "billing")
             rel = answer["reliability"]
+            self.assertEqual((rel["layout"], rel["probes"]), ("sequential", ["rename", "reorder"]))
             self.assertEqual(rel["stability"], 1.0)
             self.assertAlmostEqual(rel["soft_stability"], 0.7)
+            self.assertEqual(rel["by_probe"]["rename"]["stability"], 1.0)
             self.assertEqual(rel["distinct_choices"], ["billing"])
             self.assertEqual(rel["n_variants"], len(rel["variant_choices"]) + 1)
             self.assertEqual(rel["variants_collapsed"], rel["n_variants"] - 1)
             self.assertEqual(result["usage"]["truncated_questions"], ["intent"])
             self.assertNotIn("options", result["usage"])
 
-    def test_position_sensitive_answers_are_flagged(self):
-        rel = run(s.StabilityHook(), ["a"], deepcopy(QUESTIONS), by_first_slot).results[0]["answers"]["intent"]["reliability"]
+    def test_position_sensitive_answers_are_flagged_by_reorder_only(self):
+        rel = reliability(run(s.StabilityHook(), ["a"], deepcopy(QUESTIONS), by_first_slot))
         self.assertLess(rel["stability"], 1.0)
-        self.assertLess(rel["soft_stability"], 0.9)
-        self.assertGreater(len(rel["distinct_choices"]), 1)
+        self.assertLess(rel["by_probe"]["reorder"]["stability"], 1.0)
+        self.assertEqual(rel["by_probe"]["rename"]["stability"], 1.0)  # renames keep the slots
 
-    def test_label_sensitive_answers_flip_only_under_rename(self):
-        rel = run(s.StabilityHook(), ["a"], deepcopy(QUESTIONS), by_label).results[0]["answers"]["intent"]["reliability"]
-        for name, choice in rel["variant_choices"].items():
-            # rename answers come back under the caller's keys, never as A/B/C
-            self.assertEqual(choice, "technical" if name.startswith("rename") else "billing")
+    def test_label_sensitive_answers_are_flagged_by_rename_only(self):
+        rel = reliability(run(s.StabilityHook(), ["a"], deepcopy(QUESTIONS), by_label))
+        self.assertEqual(rel["by_probe"]["reorder"]["stability"], 1.0)
+        self.assertLess(rel["by_probe"]["rename"]["stability"], 1.0)
+        for choice in rel["variant_choices"].values():
+            self.assertIn(choice, QUESTIONS["intent"]["criteria"])  # mapped back, never A/B/C
+
+    def test_parallel_checkpoint_runs_rename_probes_only(self):
+        ctx = run(s.StabilityHook(), ["a"], deepcopy(QUESTIONS), by_description, agent=FakeAgent(parallel=True))
+        rel = reliability(ctx)
+        self.assertEqual((rel["layout"], rel["probes"]), ("parallel", ["rename"]))
+        self.assertTrue(all(name.startswith("rename") for name in rel["variant_choices"]))
+
+    def test_no_probe_reports_an_absence_not_a_zero(self):
+        questions = {"intent": {"type": "choice", "criteria": {"k%d" % i: "option %d" % i for i in range(25)}}}
+        rel = reliability(run(s.StabilityHook(), ["a"], questions, by_first_slot, agent=FakeAgent(parallel=True)))
+        self.assertEqual(rel["probes"], [])
+        self.assertIsNone(rel["soft_stability"])
+        self.assertIsNone(rel["stability"])
+        self.assertEqual((rel["n_variants"], rel["by_probe"]), (1, {}))
+
+    def test_explicit_layout_overrides_the_agent(self):
+        rel = reliability(run(s.StabilityHook(layout="parallel"), ["a"], deepcopy(QUESTIONS), by_description))
+        self.assertEqual(rel["probes"], ["rename"])
 
     def test_same_copies_for_every_state(self):
         ctx = run(s.StabilityHook(), ["a", "b", "c"], deepcopy(QUESTIONS), by_first_slot)
@@ -134,9 +176,8 @@ class HookTests(unittest.TestCase):
         questions = deepcopy(QUESTIONS)
         questions["urgent"] = {"type": "noul", "instructions": "Urgent?"}
         questions["single"] = {"type": "choice", "criteria": {"only": "the one option"}}
-        hook = s.StabilityHook()
-        ctx = PredictContext(states=["a"], questions=questions)
-        hook.on_predict_start(ctx)
+        ctx = PredictContext(states=["a"], questions=questions, agent=FakeAgent())
+        s.StabilityHook().on_predict_start(ctx)
         self.assertNotIn("urgent::stab1", ctx.questions)
         self.assertNotIn("single::stab1", ctx.questions)
         self.assertIn("intent::stab1", ctx.questions)
@@ -144,22 +185,23 @@ class HookTests(unittest.TestCase):
     def test_failed_or_skipped_calls(self):
         hook = s.StabilityHook()
         questions = deepcopy(QUESTIONS)
-        ctx = PredictContext(states=["a"], questions=questions)
+        ctx = PredictContext(states=["a"], questions=questions, agent=FakeAgent())
         hook.on_predict_start(ctx)
         hook.on_predict_end(ctx)  # inference failed: no results
         self.assertIs(ctx.questions, questions)
-        skipped = PredictContext(states=["a"], questions=questions)
+        skipped = PredictContext(states=["a"], questions=questions, agent=FakeAgent())
         skipped.skip([{"answers": {}}])
         hook.on_predict_start(skipped)
         self.assertIs(skipped.questions, questions)
         hook.on_predict_end(skipped)
 
-    def test_reserved_separator(self):
-        ctx = PredictContext(states=["a"], questions={"bad::stab1": QUESTIONS["intent"]})
+    def test_invalid_arguments(self):
+        ctx = PredictContext(states=["a"], questions={"bad::stab1": QUESTIONS["intent"]}, agent=FakeAgent())
         with self.assertRaises(ValueError):
             s.StabilityHook().on_predict_start(ctx)
-        with self.assertRaises(ValueError):
-            s.StabilityHook(shuffles=-1)
+        for kwargs in ({"shuffles": -1}, {"renames": -1}, {"layout": "diagonal"}, {"probes": ("paraphrase",)}):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                s.StabilityHook(**kwargs)
 
 
 class MetricTests(unittest.TestCase):
